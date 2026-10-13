@@ -58,8 +58,8 @@ Flight controller (PX4/ArduPilot) ──MAVLink (UART/USB)──┐             
 | Per-image reflectance (G, R, RE, NIR) | ✅ pre-flight panel + sunshine sensor | ✅ pre- and post-flight panels with drift interpolation |
 | Band co-registration | ✅ fixed transform per band (pre-computed) | ✅ refined per image |
 | Image poses | GNSS/IMU prior + sliding-window visual refinement | Global bundle adjustment (+ GCPs if surveyed) |
-| Surface model | Flat plane (paddy), optionally a coarse running height grid | Dense DSM; DTM from ground classification |
-| Reflectance orthomosaic | ✅ approximate (no relief correction) | ✅ full orthorectification on the DSM |
+| Surface model | **Live 2.5D DSM** on a 25 cm grid from stereo between consecutive frames (§7A); plane fallback where there are holes | Dense DSM at GSD; DTM from ground classification |
+| Reflectance orthomosaic | ✅ **orthorectified on the live DSM** at 5 cm (residual relief error ≤ ~1–2 px with nadir-wins blending) | ✅ full orthorectification on the dense DSM |
 | Index maps | ✅ | ✅ |
 | RGB orthomosaic | ❌ (bandwidth; rolling shutter) | ✅ |
 | Absolute position accuracy | ~2–5 m (consumer GNSS, no RTK) | ~2–5 m; **< 0.1 m with GCPs** |
@@ -71,7 +71,7 @@ The Tier A output serves scouting and spraying decisions during or right after t
 ## 3. Hardware integration
 
 ### 3.1 Bill of materials
-- **Parrot Sequoia** (body + sunshine sensor + calibration panel). Confirm whether it is **Sequoia or Sequoia+**. Sequoia+ has an absolutely calibrated sunshine sensor; the original's is relative only **[verify]**.
+- **Parrot Sequoia, original model** (body + sunshine sensor + calibration panel). Its sunshine sensor is relative only, so **the panel is mandatory before every flight**; the panel sets the absolute scale.
 - **Jetson Orin:**
   - Orin NX 16 GB is the recommended size/weight/power choice (~10–25 W).
   - AGX Orin only if the payload allows (~1.4 kg dev kit, up to 60 W).
@@ -248,13 +248,46 @@ Flagged captures are still mosaicked, but at lower priority in blending (§8).
 
 ---
 
+## 7A. Live 2.5D DSM (Tier A)
+
+**Why it is feasible.** Poses from §7 give the relative geometry between consecutive frames. Two overlapping global-shutter frames are a stereo pair. The Orin has hardware stereo-disparity support (NVIDIA VPI, semi-global matching on GPU/PVA).
+
+**Steps per new capture i** (reference band NIR, reflectance image):
+1. **Pair selection:** capture i with i−1 (forward stereo) and with the nearest capture of the previous flight line (side stereo; larger baseline).
+2. **Stereo rectification** from the refined relative pose (`cv2.stereoRectify` with the undistorted pinhole model). Work at **half resolution (640×480)**.
+3. **Disparity:** VPI SGM (or OpenCV CUDA SGM), with a left-right consistency check, a texture mask (local std below threshold → invalid) and a specular-water mask (NIR < 0.05 reflectance or saturated → invalid).
+4. **Triangulate** to 3D points in UTM/ENU.
+5. **Fuse into a height grid** of 0.25 m cells:
+   - Per-cell running weighted median, with weight ∝ 1/σz².
+   - Keep count and σ per cell.
+   - Cells with < 2 observations take the plane value, z₀ + canopy offset.
+6. **Smooth** with a 3×3 median, then serve the grid to §8.
+
+**Expected precision** (60 m, 85% forward overlap):
+- Forward baseline B ≈ 0.15 × 54 m ≈ 8 m, so B/H ≈ 0.13.
+- At half resolution (f ≈ 530 px) with 0.5 px matching precision: **σz ≈ H²·σd/(B·f) ≈ 0.4 m** per pair.
+- Fusing ~5–8 observations gives roughly 0.2 m.
+- Side stereo (B ≈ 21 m) gives about 0.15 m per pair.
+
+**What this buys for orthorectification.**
+- Relief displacement is Δ = h·r/H. Nadir-wins blending limits r to about ±4 m along track and ±11 m across track.
+- **Plane only, h = 1 m canopy:** Δ ≤ 1 × 11/60 ≈ 0.18 m ≈ 3 px at image seams.
+- **With the live DSM (σz ≈ 0.2 m):** Δ ≤ 0.2 × 11/60 ≈ 0.04 m ≈ **< 1 px**.
+- Benefit: bunds, trees, buildings, field edges and late-stage canopy line up across seams.
+
+**Limits, stated plainly:**
+- **Resolution** is 25 cm, not the 2–5 cm of an Agisoft dense DSM. Good for orthorectification, not for plant-height measurement.
+- **Holes:** uniform canopy (booting–flowering) and standing water give sparse disparities. Those cells fall back to the plane.
+- **No RTK:** the DSM is relatively consistent. Its absolute height inherits GNSS vertical error (~3–5 m). That doesn't affect orthorectification, which uses heights relative to the camera.
+- **DTM:** ground classification needs visible ground. In paddy, ground is under water or canopy for most of the season, so a photogrammetric DTM is unreliable **in any software, live or offline**. Live: a progressive morphological filter on finalised DSM tiles, giving a "lowest surface" layer flagged as approximate. Tier B: classified DTM from the dense point cloud.
+
 ## 8. Orthoprojection and mosaicking (Tier A)
 
 1. **Output grid:**
    - UTM zone of the field.
    - GSD = round-up(capture GSD) (5 cm at 60 m).
    - **Tiles of 512 × 512 px** (25.6 m at 5 cm).
-2. **Inverse projection** per capture: for each output pixel in the footprint, compute the ground point on the plane, project it into the image (pose + lens model), and sample the 4 reflectance bands bilinearly on the GPU. Footprint at 60 m ≈ 1440 × 1080 output px, about 1.5 M pixels × 4 bands.
+2. **Inverse projection** per capture: for each output pixel in the footprint, take its height from the live DSM (§7A; plane where there's no data), project that 3D point into the image (pose + lens model), and sample the 4 reflectance bands bilinearly on the GPU. Footprint at 60 m ≈ 1440 × 1080 output px, about 1.5 M pixels × 4 bands.
 3. **Per-pixel score**, Agisoft "Mosaic" blending emulation:
    ```
    s = cos(view angle) · w_flags
@@ -309,14 +342,16 @@ Flagged captures are still mosaicked, but at lower priority in blending (§8).
 | Undistort + band transform | ≤ 20 ms |
 | Features + matching | ≤ 150 ms |
 | Sliding-window solve | ≤ 30 ms |
-| Ortho + blend | ≤ 50 ms |
+| Stereo rectify + SGM (2 pairs, 640×480) + DSM fusion | ≤ 120 ms |
+| Ortho on DSM + blend | ≤ 60 ms |
 | Products + tile I/O | ≤ 50 ms (asynchronous) |
-| **Total critical path** | **≤ 650 ms (p95 < 800 ms)** |
+| **Total critical path** | **≤ 770 ms (p95 < 900 ms)** |
 
 ### 10.3 Degradation ladder (if p95 latency > 900 ms)
 Steps are applied in order until the budget is met:
 1. Skip RGB transfer.
-2. Reduce matching to the previous capture only.
+2. Live DSM: forward pair only, at quarter resolution.
+3. Reduce matching to the previous capture only.
 3. Skip visual refinement (pose prior only).
 4. Mosaic at 2× GSD.
 5. Queue and catch up during turns.
@@ -397,7 +432,7 @@ tests/               unit tests per module + golden-capture regression
 
 ## 15. Inputs needed before coding
 
-1. **Sequoia or Sequoia+?** Firmware version.
+1. ~~Sequoia or Sequoia+~~ → original Sequoia (confirmed). Firmware version still needed.
 2. **Panel reflectance values** per band (label or certificate).
 3. **Sample data:**
    - About 20 raw captures over the field.
