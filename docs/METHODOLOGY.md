@@ -64,6 +64,12 @@ Flight controller (PX4/ArduPilot) ──MAVLink (UART/USB)──┐             
 | RGB orthomosaic | ❌ (bandwidth; rolling shutter) | ✅ |
 | Absolute position accuracy | ~2–5 m (consumer GNSS, no RTK) | ~2–5 m; **< 0.1 m with GCPs** |
 
+**Role of RGB:**
+- **In flight:** recorded by the Sequoia on its own SD card and not transferred. At most, a downsampled thumbnail every Nth capture goes out for operator preview.
+- **Tier B:** RGB orthomosaic (~1.7 cm at 60 m), fine RGB DSM/DTM, and an optional RGB-DSM orthorectification of the multispectral mosaic (needs the RGB↔multispectral boresight/time calibration).
+- **Visual QA and annotation:** weeds, lodging, disease spots, missing hills; also ML training data.
+- **Never used for reflectance:** RGB is a JPEG, not radiometrically calibrated, and has no sunshine pairing.
+
 The Tier A output serves scouting and spraying decisions during or right after the flight. Tier B is the archival product for comparisons across the season.
 
 ---
