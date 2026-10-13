@@ -252,6 +252,14 @@ Flagged captures are still mosaicked, but at lower priority in blending (§8).
 
 **Why it is feasible.** Poses from §7 give the relative geometry between consecutive frames. Two overlapping global-shutter frames are a stereo pair. The Orin has hardware stereo-disparity support (NVIDIA VPI, semi-global matching on GPU/PVA).
 
+**Why multispectral frames rather than RGB (live).**
+- RGB has 3.4× finer detail, which would give ~0.06 m per-pair precision.
+- But it uses a **rolling shutter**: each image line is exposed at a different moment, and at 8 m/s the scene shifts tens of cm during readout. That needs a per-line motion model.
+- Adding RGB to the live stream costs about 5–8 MB/s of extra transfer.
+- A surface built from a different camera has to be tied to the multispectral frames through a second boresight and time-sync calibration.
+- Building the surface from the same global-shutter frames that are orthorectified avoids all three problems.
+- RGB-based DSM is used in Tier B, and live as an option only if Phase 0 shows 1 Hz RGB transfer and a characterised readout time.
+
 **Steps per new capture i** (reference band NIR, reflectance image):
 1. **Pair selection:** capture i with i−1 (forward stereo) and with the nearest capture of the previous flight line (side stereo; larger baseline).
 2. **Stereo rectification** from the refined relative pose (`cv2.stereoRectify` with the undistorted pinhole model). Work at **half resolution (640×480)**.
